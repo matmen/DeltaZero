@@ -1,3 +1,12 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SPI.h>
+#include <SD.h>
+
+OneWire oneWire(3);
+DallasTemperature tempSensors(&oneWire);
+DeviceAddress intTemp, ambTemp;
+
 const unsigned char UBX_HEADER[] = {0xB5, 0x62};
 const unsigned char NAV_POSLLH_HEADER[] = {0x01, 0x02};
 const unsigned char NAV_STATUS_HEADER[] = {0x01, 0x03};
@@ -9,8 +18,6 @@ enum _ubxMsgType {
   MT_NAV_STATUS,
   MT_NAV_TIMEUTC
 };
-
-const PROGMEM String gpsFixStates[] = {"No Fix", "Dead Reckoning", "2D", "3D", "GPS + Dead Reckoning", "Time Only"};
 
 struct NAV_POSLLH {
   unsigned char cls;
@@ -126,33 +133,110 @@ int processGPS() {
 void setup() {
   Serial.begin(9600);
   Serial1.begin(9600);
+
+  tempSensors.begin();
+
+  if (!tempSensors.getAddress(intTemp, 0)) {
+    Serial.println("Could not find IntTemp");
+    return setup();
+  }
+
+  if (!tempSensors.getAddress(ambTemp, 1)) {
+    Serial.println("Could not find AmbTemp");
+    return setup();
+  }
+
+  tempSensors.setResolution(intTemp, 8);
+  tempSensors.setResolution(ambTemp, 8);
+
+  if (!SD.begin(53)) {
+    Serial.println("Could not initialize SD card");
+    return setup();
+  }
+
+  pinMode(2, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(2), incrementRadiationCount, FALLING);
 }
 
 long lat, lon, alt;
+char fixStatus, utcTime[15];
+unsigned long lastUpdate, lastGpsPacket = millis();;
+volatile unsigned int radiationCount = 0;
 
 void loop() {
   int msgType = processGPS();
 
   if (msgType == MT_NAV_POSLLH) {
-    Serial.print("Lat: ");
-    Serial.println(ubxMessage.pos.lat / 10000000.0f, 10);
-    Serial.print("Lon: ");
-    Serial.println(ubxMessage.pos.lon / 10000000.0f, 10);
-    Serial.print("Alt (above MSL, m): ");
-    Serial.println(ubxMessage.pos.altMSL / 1000.0f);
+    lat = ubxMessage.pos.lat;
+    lon = ubxMessage.pos.lon;
+    alt = ubxMessage.pos.altMSL;
   } else if (msgType == MT_NAV_STATUS) {
-    Serial.print("Fix status: ");
-    Serial.print(gpsFixStates[(int)ubxMessage.status.gpsFix]);
-    Serial.print(" (");
-    Serial.print(ubxMessage.status.flags & 1 ? "Valid" : "Invalid");
-    Serial.println(")");
+    fixStatus = ubxMessage.status.gpsFix | (ubxMessage.status.flags & B00000001) << 3;
   } else if (msgType == MT_NAV_TIMEUTC) {
-    char timeString[20];
-    sprintf(timeString, "%02d.%02d.%04d %02d:%02d:%02d", ubxMessage.time.day, ubxMessage.time.month, ubxMessage.time.year, ubxMessage.time.hour, ubxMessage.time.minute, ubxMessage.time.second);
-    Serial.print("Time (UTC): ");
-    Serial.println(timeString);
-    Serial.println();
+    sprintf(utcTime, "%02d%02d%04d%02d%02d%02d", ubxMessage.time.day, ubxMessage.time.month, ubxMessage.time.year, ubxMessage.time.hour, ubxMessage.time.minute, ubxMessage.time.second);
   }
 
+  if (msgType != MT_NONE) lastGpsPacket = millis();
+
+  if (millis() - lastUpdate >= 1000) {
+    if (millis() - lastGpsPacket > 10000) {
+      fixStatus = 0;
+      Serial.println("*** WARNING *** Last GPS packet received >10s ago");
+    }
+
+    tempSensors.requestTemperatures();
+    float intTempC = tempSensors.getTempC(intTemp);
+    float ambTempC = tempSensors.getTempC(ambTemp);
+
+    unsigned long cpm = radiationCount * (60000 / (millis() - lastUpdate));
+    radiationCount = 0;
+
+    Serial.print("$MOD");
+    Serial.print(fixStatus, DEC);
+    Serial.print(" LAT");
+    Serial.print(lat / 10000000.0f, 8);
+    Serial.print(" LON");
+    Serial.print(lon / 10000000.0f, 8);
+    Serial.print(" ALT");
+    Serial.print(alt / 1000.0f, 8);
+    Serial.print(" UTC");
+    Serial.print(utcTime);
+    Serial.print(" INT");
+    Serial.print(intTempC);
+    Serial.print(" AMB");
+    Serial.print(ambTempC);
+    Serial.print(" RCM");
+    Serial.print(cpm);
+    Serial.println();
+
+    File file = SD.open("log.txt", FILE_WRITE);
+    if (file) {
+      file.print("$MOD");
+      file.print(fixStatus, DEC);
+      file.print(" LAT");
+      file.print(lat / 10000000.0f, 8);
+      file.print(" LON");
+      file.print(lon / 10000000.0f, 8);
+      file.print(" ALT");
+      file.print(alt / 1000.0f, 8);
+      file.print(" UTC");
+      file.print(utcTime);
+      file.print(" INT");
+      file.print(intTempC);
+      file.print(" AMB");
+      file.print(ambTempC);
+      file.print(" RCM");
+      file.print(cpm);
+      file.println();
+      file.close();
+    } else setup();
+
+    lastUpdate = millis();
+  }
+}
+
+void incrementRadiationCount() {
+  radiationCount++;
 }
 
